@@ -1,0 +1,9 @@
+# data
+data
+*.zip
+
+# model
+*.pth
+
+# pycache
+__pycache__
