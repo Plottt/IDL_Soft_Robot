@@ -12,6 +12,10 @@ from tqdm import tqdm
 import random
 import os
 from typing import Dict, List, Tuple
+import multiprocessing as mp
+from functools import partial
+import pickle
+import hashlib
 
 # Set random seeds for reproducibility
 random.seed(42)
@@ -28,8 +32,13 @@ config = {
     'hidden_dim': 128,
     'dropout': 0.3,
     'checkpoint_dir': "ckpt_baseline",
-    'device': 'cuda' if torch.cuda.is_available() else 'cpu'
+    'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+    'num_workers': mp.cpu_count() // 2,  # Use half of available CPU cores
+    'cache_dir': "feature_cache"  # Directory to store pre-calculated features
 }
+
+# Create cache directory if it doesn't exist
+os.makedirs(config['cache_dir'], exist_ok=True)
 
 # Define category mapping
 CATEGORIES = {
@@ -226,17 +235,26 @@ def extract_statistical_features(df):
             # Basic statistics for position and force sensors
             for col in ['x', 'y', 'pwm1', 'pwm2', 'pwm3', 'pwm4']:
                 if col in group.columns:
-                    features[f'{col}_wp{wp}_mean'] = group[col].mean()
-                    features[f'{col}_wp{wp}_std'] = group[col].std()
-                    features[f'{col}_wp{wp}_min'] = group[col].min()
-                    features[f'{col}_wp{wp}_max'] = group[col].max()
-                    features[f'{col}_wp{wp}_range'] = group[col].max() - group[col].min()
+                    # Handle mean and std calculations safely
+                    mean_val = group[col].mean()
+                    std_val = group[col].std() if len(group) > 1 else 0.0
+                    min_val = group[col].min()
+                    max_val = group[col].max()
+                    
+                    features[f'{col}_wp{wp}_mean'] = mean_val if not pd.isna(mean_val) else 0.0
+                    features[f'{col}_wp{wp}_std'] = std_val if not pd.isna(std_val) else 0.0
+                    features[f'{col}_wp{wp}_min'] = min_val if not pd.isna(min_val) else 0.0
+                    features[f'{col}_wp{wp}_max'] = max_val if not pd.isna(max_val) else 0.0
+                    features[f'{col}_wp{wp}_range'] = (max_val - min_val) if not (pd.isna(max_val) or pd.isna(min_val)) else 0.0
             
             # Calculate distance between actual and target positions
             if 'x' in group.columns and 'y' in group.columns and 'x_target' in group.columns and 'y_target' in group.columns:
                 distances = np.sqrt((group['x'] - group['x_target'])**2 + (group['y'] - group['y_target'])**2)
-                features[f'distance_wp{wp}_mean'] = distances.mean()
-                features[f'distance_wp{wp}_std'] = distances.std()
+                dist_mean = distances.mean()
+                dist_std = distances.std() if len(distances) > 1 else 0.0
+                
+                features[f'distance_wp{wp}_mean'] = dist_mean if not pd.isna(dist_mean) else 0.0
+                features[f'distance_wp{wp}_std'] = dist_std if not pd.isna(dist_std) else 0.0
         else:
             # If waypoint doesn't exist, fill with zeros
             for col in ['x', 'y', 'pwm1', 'pwm2', 'pwm3', 'pwm4']:
@@ -252,16 +270,23 @@ def extract_statistical_features(df):
     # Calculate overall statistics across all waypoints
     for col in ['x', 'y', 'pwm1', 'pwm2', 'pwm3', 'pwm4']:
         if col in df.columns:
-            features[f'{col}_overall_mean'] = df[col].mean()
-            features[f'{col}_overall_std'] = df[col].std()
-            features[f'{col}_overall_min'] = df[col].min()
-            features[f'{col}_overall_max'] = df[col].max()
-            features[f'{col}_overall_range'] = df[col].max() - df[col].min()
+            # Handle overall statistics safely
+            mean_val = df[col].mean()
+            std_val = df[col].std() if len(df) > 1 else 0.0
+            min_val = df[col].min()
+            max_val = df[col].max()
+            
+            features[f'{col}_overall_mean'] = mean_val if not pd.isna(mean_val) else 0.0
+            features[f'{col}_overall_std'] = std_val if not pd.isna(std_val) else 0.0
+            features[f'{col}_overall_min'] = min_val if not pd.isna(min_val) else 0.0
+            features[f'{col}_overall_max'] = max_val if not pd.isna(max_val) else 0.0
+            features[f'{col}_overall_range'] = (max_val - min_val) if not (pd.isna(max_val) or pd.isna(min_val)) else 0.0
     
-    # Calculate time-based features
+    # Calculate time-based features safely
     if 'seconds' in df.columns:
-        features['total_time'] = df['seconds'].max() - df['seconds'].min()
-        features['time_per_waypoint'] = features['total_time'] / expected_waypoints
+        total_time = df['seconds'].max() - df['seconds'].min()
+        features['total_time'] = total_time if not pd.isna(total_time) else 0.0
+        features['time_per_waypoint'] = total_time / expected_waypoints if expected_waypoints > 0 and not pd.isna(total_time) else 0.0
     
     # Add label
     features['label'] = df['label'].iloc[0]
@@ -269,9 +294,29 @@ def extract_statistical_features(df):
     
     return features
 
+# Function to process a single window
+def process_window(args):
+    window_data, feature_keys = args
+    features = extract_statistical_features(window_data)
+    if features is not None:
+        # Get the label for this window (use the majority label in the window)
+        label = window_data['label'].mode().iloc[0]
+        
+        # Extract features in a consistent order
+        feature_values = [features[k] for k in feature_keys]
+        
+        return feature_values, label
+    return None
+
+# Function to generate a cache key for a dataset
+def generate_cache_key(df, seq_len):
+    # Create a hash of the dataframe content and sequence length
+    df_hash = hashlib.md5(pd.util.hash_pandas_object(df).values).hexdigest()
+    return f"{df_hash}_{seq_len}"
+
 # Create a dataset class for the statistical features
 class StatisticalDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, seq_len: int = 2500):
+    def __init__(self, df: pd.DataFrame, seq_len: int = 2500, use_cache: bool = True):
         self.seq_len = seq_len
         self.df = df.reset_index(drop=True)
         
@@ -286,30 +331,62 @@ class StatisticalDataset(Dataset):
         # Calculate the number of samples
         self.num_samples = len(self.df) - self.seq_len + 1
         
-        # Pre-compute statistical features for each window
-        self.statistical_features = []
-        self.statistical_labels = []
+        # Generate cache key
+        cache_key = generate_cache_key(self.df, seq_len)
+        cache_file = os.path.join(config['cache_dir'], f"statistical_features_{cache_key}.pkl")
         
-        print(f"Computing statistical features for {self.num_samples} windows...")
-        for i in tqdm(range(self.num_samples)):
-            # Get the window data
-            window_data = self.df.iloc[i:i+self.seq_len]
+        # Check if cached features exist
+        if use_cache and os.path.exists(cache_file):
+            print(f"Loading pre-calculated features from {cache_file}...")
+            with open(cache_file, 'rb') as f:
+                cached_data = pickle.load(f)
+                self.statistical_features = cached_data['features']
+                self.statistical_labels = cached_data['labels']
+                self.feature_keys = cached_data['feature_keys']
+        else:
+            # Get the first window to determine feature keys
+            first_window = self.df.iloc[0:self.seq_len]
+            first_features = extract_statistical_features(first_window)
+            if first_features is None:
+                raise ValueError("Failed to extract features from the first window")
             
-            # Extract statistical features from the window
-            features = extract_statistical_features(window_data)
-            if features is not None:
-                # Get the label for this window (use the majority label in the window)
-                label = window_data['label'].mode().iloc[0]
-                
-                # Extract features in a consistent order
-                feature_values = [v for k, v in features.items() if k not in ['label', 'category']]
-                
-                self.statistical_features.append(feature_values)
-                self.statistical_labels.append(label)
-        
-        # Convert to tensors
-        self.statistical_features = torch.tensor(self.statistical_features, dtype=torch.float32)
-        self.statistical_labels = torch.tensor(self.statistical_labels, dtype=torch.long)
+            # Get the feature keys in a consistent order
+            self.feature_keys = sorted([k for k in first_features.keys() if k not in ['label', 'category']])
+            
+            # Pre-compute statistical features for each window using parallel processing
+            print(f"Computing statistical features for {self.num_samples} windows using {config['num_workers']} workers...")
+            
+            # Prepare arguments for parallel processing
+            process_args = []
+            for i in range(self.num_samples):
+                window_data = self.df.iloc[i:i+self.seq_len]
+                process_args.append((window_data, self.feature_keys))
+            
+            # Process windows in parallel
+            with mp.Pool(processes=config['num_workers']) as pool:
+                results = list(tqdm(pool.imap(process_window, process_args), total=len(process_args)))
+            
+            # Filter out None results and separate features and labels
+            valid_results = [r for r in results if r is not None]
+            if not valid_results:
+                raise ValueError("No valid features were extracted from any window")
+            
+            self.statistical_features = [r[0] for r in valid_results]
+            self.statistical_labels = [r[1] for r in valid_results]
+            
+            # Convert to tensors
+            self.statistical_features = torch.tensor(self.statistical_features, dtype=torch.float32)
+            self.statistical_labels = torch.tensor(self.statistical_labels, dtype=torch.long)
+            
+            # Cache the results
+            if use_cache:
+                print(f"Saving pre-calculated features to {cache_file}...")
+                with open(cache_file, 'wb') as f:
+                    pickle.dump({
+                        'features': self.statistical_features,
+                        'labels': self.statistical_labels,
+                        'feature_keys': self.feature_keys
+                    }, f)
         
         # Print feature dimension
         print(f"Feature dimension: {self.statistical_features.shape[1]}")
@@ -379,7 +456,7 @@ def accuracy(output, target, topk=(1,)):
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
-# Training function
+# Training function with debugging
 def train_model(model, train_loader, criterion, optimizer, device):
     model.train()
     loss_m = AverageMeter()
@@ -389,11 +466,51 @@ def train_model(model, train_loader, criterion, optimizer, device):
     for i, data in enumerate(train_loader):
         optimizer.zero_grad()
         x, y = data
+        
+        # Debug: Check for NaN or Inf in input data
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print(f"WARNING: NaN or Inf detected in input data at batch {i}")
+            print(f"NaN count: {torch.isnan(x).sum().item()}, Inf count: {torch.isinf(x).sum().item()}")
+            # Replace NaN and Inf with zeros
+            x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+        
         x, y = x.to(device), y.to(device)
+        
+        # Debug: Print input statistics
+        if i == 0:
+            print(f"Input stats - Min: {x.min().item():.4f}, Max: {x.max().item():.4f}, Mean: {x.mean().item():.4f}, Std: {x.std().item():.4f}")
+        
         outputs = model(x)
+        
+        # Debug: Check for NaN or Inf in model outputs
+        if torch.isnan(outputs['out']).any() or torch.isinf(outputs['out']).any():
+            print(f"WARNING: NaN or Inf detected in model outputs at batch {i}")
+            print(f"NaN count: {torch.isnan(outputs['out']).sum().item()}, Inf count: {torch.isinf(outputs['out']).sum().item()}")
+            # Replace NaN and Inf with small values
+            outputs['out'] = torch.nan_to_num(outputs['out'], nan=1e-6, posinf=1.0, neginf=1e-6)
+        
         loss = criterion(outputs['out'], y)
+        
+        # Debug: Check for NaN or Inf in loss
+        if torch.isnan(loss).any() or torch.isinf(loss).any():
+            print(f"WARNING: NaN or Inf detected in loss at batch {i}")
+            print(f"Loss value: {loss.item()}")
+            # Skip this batch
+            continue
+        
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        
+        # Debug: Check for NaN or Inf in gradients
+        for name, param in model.named_parameters():
+            if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                print(f"WARNING: NaN or Inf detected in gradients for {name} at batch {i}")
+                print(f"NaN count: {torch.isnan(param.grad).sum().item()}, Inf count: {torch.isinf(param.grad).sum().item()}")
+                # Clip gradients
+                param.grad = torch.nan_to_num(param.grad, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        # Gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
         optimizer.step()
 
         acc = accuracy(outputs['out'], y)[0].item()
@@ -540,7 +657,43 @@ def save_model(model, optimizer, scheduler, metrics, epoch, path):
         'metrics': metrics
     }, path)
 
-# Main function
+# Function to check data quality
+def check_data_quality(dataset, name="dataset"):
+    """Check for potential issues in the dataset."""
+    print(f"\nChecking {name} quality...")
+    
+    # Check for NaN or Inf in features
+    features = dataset.statistical_features
+    if torch.isnan(features).any() or torch.isinf(features).any():
+        print(f"WARNING: NaN or Inf detected in {name} features")
+        print(f"NaN count: {torch.isnan(features).sum().item()}, Inf count: {torch.isinf(features).sum().item()}")
+        
+        # Print statistics for debugging
+        print(f"Feature stats - Min: {features.min().item():.4f}, Max: {features.max().item():.4f}, Mean: {features.mean().item():.4f}, Std: {features.std().item():.4f}")
+        
+        # Replace NaN and Inf with zeros
+        features = torch.nan_to_num(features, nan=0.0, posinf=1e6, neginf=-1e6)
+        dataset.statistical_features = features
+    
+    # Check for extreme values
+    if features.max().item() > 1e6 or features.min().item() < -1e6:
+        print(f"WARNING: Extreme values detected in {name} features")
+        print(f"Min: {features.min().item():.4f}, Max: {features.max().item():.4f}")
+        
+        # Normalize features to a reasonable range
+        features = torch.clamp(features, min=-1e6, max=1e6)
+        dataset.statistical_features = features
+    
+    # Check for class imbalance
+    labels = dataset.statistical_labels
+    unique_labels, counts = torch.unique(labels, return_counts=True)
+    print(f"Class distribution in {name}:")
+    for label, count in zip(unique_labels.tolist(), counts.tolist()):
+        print(f"  Class {label}: {count} samples ({count/len(labels)*100:.2f}%)")
+    
+    return dataset
+
+# Main function with debugging
 def main():
     # Create checkpoint directory if it doesn't exist
     os.makedirs(config['checkpoint_dir'], exist_ok=True)
@@ -548,16 +701,16 @@ def main():
     # Build datasets
     train_df, val_df, test_df = build_datasets(folder_path)
     
-    # Group data by file for statistical feature extraction
-    train_files = train_df.groupby('category').apply(lambda x: x).reset_index(drop=True)
-    val_files = val_df.groupby('category').apply(lambda x: x).reset_index(drop=True)
-    test_files = test_df.groupby('category').apply(lambda x: x).reset_index(drop=True)
-    
     # Create datasets
     seq_len = 2500  # Same as in train_0414.py
-    train_dataset = StatisticalDataset(train_files, seq_len=seq_len)
-    val_dataset = StatisticalDataset(val_files, seq_len=seq_len)
-    test_dataset = StatisticalDataset(test_files, seq_len=seq_len)
+    train_dataset = StatisticalDataset(train_df, seq_len=seq_len)
+    val_dataset = StatisticalDataset(val_df, seq_len=seq_len)
+    test_dataset = StatisticalDataset(test_df, seq_len=seq_len)
+    
+    # Check data quality
+    train_dataset = check_data_quality(train_dataset, "train")
+    val_dataset = check_data_quality(val_dataset, "validation")
+    test_dataset = check_data_quality(test_dataset, "test")
     
     print(f"Train dataset size: {len(train_dataset)}")
     print(f"Val dataset size: {len(val_dataset)}")
@@ -569,13 +722,17 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False)
     
     # Initialize model
-    input_dim = train_dataset.features.shape[1]
+    input_dim = train_dataset.statistical_features.shape[1]
     model = MLPClassifier(
         input_dim=input_dim,
         hidden_dim=config['hidden_dim'],
         num_classes=len(CATEGORIES),
         dropout=config['dropout']
     ).to(config['device'])
+    
+    # Debug: Print model architecture
+    from torchinfo import summary
+    summary(model, input_size=(config['batch_size'], input_dim))
     
     # Define loss function and optimizer
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
